@@ -1,4 +1,9 @@
-// inter_controller.c
+// app.c — teste de RR + SHM + I/O (IRQ1) sem setenv
+// - argv[1] = shm_id (inteiro)
+// - Anexa à SHM, encontra idx pelo PID em shm->app_pid[]
+// - Loop de 20 iterações: atualiza pc e pede I/O em pc=3 e pc=8
+// - Conta retomadas (SIGCONT) e imprime PASS/FAIL
+
 
 #define _XOPEN_SOURCE 700
 #include <stdio.h>
