@@ -4,133 +4,116 @@
 // - Loop de 20 iterações: atualiza pc e pede I/O em pc=3 e pc=8
 // - Conta retomadas (SIGCONT) e imprime PASS/FAIL
 
+// app.c — processo de aplicação Ai
+
 #define _XOPEN_SOURCE 700
 #include <stdio.h>
 #include <stdlib.h>
 #include <signal.h>
 #include <string.h>
 #include <unistd.h>
-#include <time.h>
 #include <sys/ipc.h>
 #include <sys/shm.h>
 #include <sys/types.h>
+#include <time.h>   // para nanosleep
 
-#define MAX_PROCS 32
-
-/* Estrutura da SHM (espelha o kernel) */
 struct shm_data {
-  int    nprocs;
-  pid_t  app_pid[MAX_PROCS];
-  volatile int pc[MAX_PROCS];
-  volatile int want_io[MAX_PROCS];
-  volatile int io_type[MAX_PROCS];
-  volatile int st[MAX_PROCS];
-  int q[MAX_PROCS]; int head, tail;
-  int d1_busy;
+  int  nprocs;
+  pid_t app_pid[6];
+  int  pc[6];
+  int  want_io[6];
+  int  io_type[6];
+  int  done;
+  int  d1_busy;
   pid_t io_inflight_pid;
-  time_t t_end;
-  int done;
+
+  pid_t io_done_pid;
+  int   io_done_type;
 };
 
-/* Contador de retomadas pela CPU (SIGCONT) */
-static volatile sig_atomic_t resumes = 0;
+static volatile sig_atomic_t got_sigcont = 0;
 
-/* Identificação do processo neste app */
-static int idx = -1;
-static struct shm_data *shm = NULL;
-static pid_t me = 0;
+static void on_sigcont(int sig){ (void)sig; got_sigcont = 1; }
 
-/* Handler persistente de SIGCONT (conta retomadas) */
-static void on_sigcont(int s) {
-  (void)s;
-  resumes++;
-  printf("[APP pid=%d idx=%d] SIGCONT #%d\n", (int)me, idx, (int)resumes);
-  fflush(stdout);
-}
+int main(int argc, char **argv) {
+  pid_t me = getpid();
 
-/* Sleep simples em milissegundos (para simular trabalho) */
-static void msleep(int ms){
-  struct timespec ts;
-  ts.tv_sec  = ms / 1000;
-  ts.tv_nsec = (ms % 1000) * 1000000L;
-  nanosleep(&ts, NULL);
-}
-
-int main(int argc, char **argv){
-  me = getpid();
-
-  /* Registro persistente do handler de SIGCONT */
-  struct sigaction sa;
-  memset(&sa, 0, sizeof(sa));
-  sa.sa_handler = on_sigcont;
-  sigemptyset(&sa.sa_mask);
-  sa.sa_flags = SA_RESTART;
-  sigaction(SIGCONT, &sa, NULL);
-
-  /* shm_id via argv[1] */
-  if (argc < 2){
-    fprintf(stderr, "[APP pid=%d] FAIL: uso: ./app <shm_id>\n", (int)me);
+  if (argc < 2) {
+    fprintf(stderr, "[APP pid=%d] uso: ./app <shm_id>\n", (int)me);
     return 2;
   }
   int shm_id = atoi(argv[1]);
-  if (shm_id <= 0){
-    fprintf(stderr, "[APP pid=%d] FAIL: shm_id invalido\n", (int)me);
-    return 2;
-  }
+  struct shm_data *shm = (struct shm_data*)shmat(shm_id, NULL, 0);
+  if (shm == (void*)-1) { perror("[APP] shmat"); return 1; }
 
-  /* Anexa à SHM fornecida pelo kernel */
-  shm = (struct shm_data*)shmat(shm_id, NULL, 0);
-  if (shm == (void*)-1){
-    perror("shmat");
-    fprintf(stderr, "[APP pid=%d] FAIL: nao anexou SHM\n", (int)me);
-    return 2;
-  }
-
-  /* Descobre o índice deste processo na tabela do kernel */
-  for (int tries = 0; tries < 50 && idx < 0; tries++){
-    for (int i = 0; i < shm->nprocs; i++){
-      if (shm->app_pid[i] == me){ idx = i; break; }
+  // acha meu índice
+  int idx = -1;
+  for (int tries = 0; tries < 100 && idx < 0; tries++) {
+    for (int i = 0; i < shm->nprocs; i++) {
+      if (shm->app_pid[i] == me) { idx = i; break; }
     }
-    if (idx < 0) msleep(50);
+    if (idx < 0) {
+      struct timespec ts = {0, 50 * 1000 * 1000}; // 50ms
+      nanosleep(&ts, NULL);
+    }
   }
   if (idx < 0){
-    fprintf(stderr, "[APP pid=%d] FAIL: nao achei meu PID na SHM\n", (int)me);
-    shmdt((void*)shm);
-    return 2;
+    fprintf(stderr, "[APP pid=%d] FAIL: não achei meu idx na SHM\n",(int)me);
+    shmdt((void*)shm); return 2;
   }
 
-  printf("[APP pid=%d idx=%d] START\n", (int)me, idx);
-  fflush(stdout);
+  // handler de retomada
+  struct sigaction sa;
+  memset(&sa,0,sizeof(sa));
+  sa.sa_handler=on_sigcont; sigemptyset(&sa.sa_mask); sa.sa_flags=SA_RESTART;
+  sigaction(SIGCONT,&sa,NULL);
 
-  /* Trabalho “CPU-bound” com 2 pedidos de I/O */
-  const int total_iters    = 20;
-  const int io_reqs_meta   = 2;
-  int       io_feitos      = 0;
+  // estado local
+  int i = 0;                     // PC local (espelhado à SHM)
+  int total_iters = 20;          // 20 iterações como no enunciado
+  int io_feitos = 0;             // pedidos feitos
+  int resumes = 0;               // contagem de SIGCONT
+  int next_io_type = 0;          // alterna READ(0)/WRITE(1)
 
-  for (int i = 0; i < total_iters; i++){
-    shm->pc[idx] = i;
+  printf("[APP pid=%d idx=%d] INÍCIO\n", (int)me, idx); fflush(stdout);
 
-    if (i == 3 || i == 8){
-      shm->want_io[idx] = 1;  /* kernel observa isso e bloqueia em WAITING */
-      io_feitos++;
-      printf("[APP pid=%d idx=%d] IO_REQ at pc=%d\n", (int)me, idx, i);
+  // loop controlado por i (PC explícito). Em toda retomada, sincroniza com SHM.
+  while (i < total_iters) {
+    if (got_sigcont) {
+      got_sigcont = 0;
+      resumes++;
+      // restaura PC lógico explicitamente:
+      i = shm->pc[idx];
+      printf("[APP pid=%d idx=%d] RETORNO (SIGCONT) -> restaura pc=%d\n",(int)me,idx,i);
       fflush(stdout);
     }
 
-    msleep(180);  /* simula uso de CPU; deixa tempo pro kernel alternar */
+    // "executa instrução"
+    shm->pc[idx] = i;
+
+    // syscalls didáticas nos PCs 3 e 8
+    if (i == 3 || i == 8) {
+      shm->want_io[idx] = 1;
+      shm->io_type[idx] = next_io_type;         // 0=READ, 1=WRITE
+      next_io_type ^= 1;                         // alterna
+      printf("[APP pid=%d idx=%d] SYSCALL I/O %s em pc=%d\n",
+             (int)me, idx, shm->io_type[idx]==0?"READ":"WRITE", i);
+      fflush(stdout);
+      io_feitos++;
+    }
+
+    // dorme 1s como pede o enunciado
+    sleep(1);
+
+    // avança PC local e espelha
+    i++;
+    shm->pc[idx] = i;
   }
 
-  /* Resultado do teste: 2 I/O e pelo menos 2 retomadas */
-  printf("[APP pid=%d idx=%d] DONE (iters=%d, io_reqs=%d, resumes=%d)\n",
-         (int)me, idx, total_iters, io_feitos, (int)resumes);
-  if (io_feitos == io_reqs_meta && resumes >= 2){
-    printf("[APP pid=%d idx=%d] TEST RESULT: PASS\n", (int)me, idx);
-  } else {
-    printf("[APP pid=%d idx=%d] TEST RESULT: FAIL (esperado io=2 e resumes>=2)\n",
-           (int)me, idx);
-  }
+  printf("[APP pid=%d idx=%d] FIM (iters=%d, io_reqs=%d, resumes=%d)\n",
+         (int)me, idx, total_iters, io_feitos, resumes);
   fflush(stdout);
 
-  if (shm && shm != (void*)-1) shmdt((void*)shm);
+  shmdt((void*)shm);
   return 0;
 }
