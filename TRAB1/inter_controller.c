@@ -1,3 +1,4 @@
+// Integrantes do Grupo: Miguel Mendes (2111705) e Igor Lemos (2011287)
 /* inter_controller.c - Simula controlador de interrupções
     - Envia SIGUSR1 (IRQ0) ao kernel a cada 1s (time-slice).
     - Envia SIGUSR2 (IRQ1) ao kernel 3s após cada pedido de I/O no FIFO.

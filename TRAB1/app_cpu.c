@@ -1,3 +1,4 @@
+// Integrantes do Grupo: Miguel Mendes (2111705) e Igor Lemos (2011287)
 // app_cpu.c — processo sem I/O (só CPU): útil pra testar preempção pura
 
 #include <stdio.h>

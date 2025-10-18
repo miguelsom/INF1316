@@ -1,3 +1,4 @@
+// Integrantes do Grupo: Miguel Mendes (2111705) e Igor Lemos (2011287)
 // app_rw.c — processo que faz I/O em pc=3 (READ) e pc=8 (WRITE)
 
 #include <stdio.h>

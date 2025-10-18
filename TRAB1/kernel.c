@@ -1,3 +1,4 @@
+// Integrantes do Grupo: Miguel Mendes (2111705) e Igor Lemos (2011287)
 // kernel.c - processo kernel que gerencia escalonamento RR + I/O com SHM e FIFO
 
 #include <signal.h>
