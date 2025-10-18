@@ -86,7 +86,7 @@ int main(int argc, char **argv){
       break;
     }
 
-    usleep(100000); // 100ms
+    sleep(1);
     unsigned long t = tempo_ms();
 
     /* IRQ0 periódico */
