@@ -13,6 +13,7 @@
 #include <unistd.h>
 #include <errno.h>
 #include <time.h>
+#include <stdbool.h>
 
 #define MAXN  6
 #define MINN  3
@@ -246,7 +247,7 @@ int main(int argc, char **argv) {
 
   time_t t0 = time(NULL);
 
-  while (1) {
+  while (true) {
     if (stop_flag) break;
     if (time(NULL) - t0 >= run_duration_seconds) break;
 
@@ -266,10 +267,13 @@ int main(int argc, char **argv) {
 
       if (time_slice_left > 0) time_slice_left--;
       if (time_slice_left == 0) {
-        // FIX mínimo: preserve o índice preemptado para o ponto de partida do RR
         int prev = current_idx;
-        if (current_idx >= 0) preempt_running_to_ready();
-        if (prev >= 0) current_idx = prev; // apenas para pick_next_ready iniciar do próximo
+        if (current_idx >= 0){
+          preempt_running_to_ready();
+        }
+        if (prev >= 0){
+          current_idx = prev;
+        }
         int nxt = pick_next_ready();
         if (nxt >= 0) {
           dispatch_index(nxt);
