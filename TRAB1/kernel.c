@@ -1,6 +1,5 @@
-// kernel.c 
+// kernel.c - processo kernel que gerencia escalonamento RR + I/O com SHM e FIFO
 
-#define _XOPEN_SOURCE 700
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -267,9 +266,17 @@ int main(int argc, char **argv) {
 
       if (time_slice_left > 0) time_slice_left--;
       if (time_slice_left == 0) {
+        // FIX mínimo: preserve o índice preemptado para o ponto de partida do RR
+        int prev = current_idx;
         if (current_idx >= 0) preempt_running_to_ready();
+        if (prev >= 0) current_idx = prev; // apenas para pick_next_ready iniciar do próximo
         int nxt = pick_next_ready();
-        if (nxt >= 0) { dispatch_index(nxt); time_slice_left = time_slice_seconds; }
+        if (nxt >= 0) {
+          dispatch_index(nxt);
+          time_slice_left = time_slice_seconds;
+        } else {
+          current_idx = -1; // ninguém pronto
+        }
       }
     }
 

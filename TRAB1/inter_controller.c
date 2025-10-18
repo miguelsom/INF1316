@@ -1,34 +1,35 @@
-// app.c — teste de RR + SHM + I/O (IRQ1) sem setenv
-// - argv[1] = shm_id (inteiro)
-// - Anexa à SHM, encontra idx pelo PID em shm->app_pid[]
-// - Loop de 20 iterações: atualiza pc e pede I/O em pc=3 e pc=8
-// - Conta retomadas (SIGCONT) e imprime PASS/FAIL
+/* inter_controller.c - Simula controlador de interrupções
+    - Envia SIGUSR1 (IRQ0) ao kernel a cada 1s (time-slice).
+    - Envia SIGUSR2 (IRQ1) ao kernel 3s após cada pedido de I/O no FIFO.
 
+  Uso:
+    ./inter_controller <shm_id> <kernel_pid>
+*/
 
-#define _XOPEN_SOURCE 700
-#include <stdio.h>
-#include <stdlib.h>
 #include <signal.h>
-#include <string.h>
 #include <unistd.h>
+#include <fcntl.h>
+#include <time.h>
+#include <stdlib.h>
+#include <sys/types.h>
+#include <stdio.h>
+#include <stdbool.h>
 #include <sys/ipc.h>
 #include <sys/shm.h>
-#include <fcntl.h>
-#include <errno.h>
-#include <time.h>
 
-#define FIFO_PATH "/tmp/so_trab1_iofifo"
-
-// ===== util de tempo (ms relativos) =====
-static long t0_ms = -1;
-static long now_ms(void){
-  struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
-  return (long)ts.tv_sec*1000L + ts.tv_nsec/1000000L;
+/* Retorna o tempo em ms desde que o sistema foi iniciado */
+static unsigned long tempo_ms(void){
+  struct timespec ts; // Struct do time.h, para guardar segundos e nanossegundos
+  clock_gettime(CLOCK_MONOTONIC, &ts); // Preenche a struct com o tempo "monotônico" (desde o boot)
+  return (ts.tv_sec * 1000) +(ts.tv_nsec / 1000000); // tv_sec é segundos, tv_nsec é nanossegundos
 }
-static void init_t0(void){ if (t0_ms < 0) t0_ms = now_ms(); }
-static long rel_ms(void){ return now_ms() - t0_ms; }
-// =======================================
 
+/* Retorna o tempo relativo em ms desde um t0 */
+static unsigned long rel_ms(unsigned long t0){
+  return tempo_ms() - t0;
+}
+
+/* Estrutura deve ser compatível com a do kernel */
 struct shm_data {
   int  nprocs;
   pid_t app_pid[6];
@@ -36,111 +37,146 @@ struct shm_data {
   int  want_io[6];
   int  io_type[6];
   int  done;
-
   int  d1_busy;
   pid_t io_inflight_pid;
-
   pid_t io_done_pid;
   int   io_done_type;
 };
 
-static volatile sig_atomic_t stop_flag = 0;
-static void on_stop(int sig){ (void)sig; stop_flag = 1; }
-
-int main(int argc, char **argv) {
-  if (argc < 3) {
-    fprintf(stderr, "[IC] uso: ./inter_controller <shm_id> <kernel_pid>\n");
-    return 2;
+int main(int argc, char **argv){
+  if (argc < 3){
+    fprintf(stderr, "Uso: %s <shm_id> <kernel_pid>\n", argv[0]);
+    return 1;
   }
+
   int shm_id = atoi(argv[1]);
   pid_t kpid  = (pid_t)atoi(argv[2]);
 
-  init_t0();
-
-  struct sigaction sa;
-  memset(&sa,0,sizeof(sa));
-  sa.sa_handler = on_stop; sigemptyset(&sa.sa_mask); sa.sa_flags = SA_RESTART;
-  sigaction(SIGINT,&sa,NULL); sigaction(SIGTERM,&sa,NULL);
-
   struct shm_data *shm = (struct shm_data*)shmat(shm_id, NULL, 0);
-  if (shm == (void*)-1) { perror("[IC] shmat"); return 1; }
+  if (shm == (void*)-1){
+    perror("[IC] shmat");
+    return 1;
+  }
 
-  int fd = open(FIFO_PATH, O_RDONLY | O_NONBLOCK);
-  if (fd < 0) { perror("[IC] open fifo rd"); return 1; }
+  const int IRQ0_SIG = SIGUSR1;
+  const int IRQ1_SIG = SIGUSR2;
+  const unsigned long MS_TIMESLICE = 1000;
+  const unsigned long MS_IO = 3000;
+  const char *FIFO_CAMINHO = "/tmp/so_trab1_iofifo";
 
-  printf("[IC %ldms] INÍCIO (kpid=%d)\n", rel_ms(), (int)kpid); fflush(stdout);
+  int file_fifo = open(FIFO_CAMINHO, O_RDONLY | O_NONBLOCK);
+  if (file_fifo < 0){
+    perror("[IC] não foi possível abrir FIFO. IRQ1 não será testável.\n");
+  }
 
-  pid_t q_pid[64]; int q_type[64]; int qh=0, qt=0;
-  int busy = 0;
-  time_t end_time = 0;
-  pid_t cur_pid = 0; int cur_type = 0;
+  unsigned long t0 = tempo_ms();
+  printf("[IC %ldms] INÍCIO (kpid=%d)\n", rel_ms(t0), (int)kpid);
+  fflush(stdout);
 
-  while (1) {
-    if (stop_flag) break;
+  /* Estado dos timers e fila */
+  unsigned long prox_irq0 = tempo_ms() + MS_TIMESLICE;
+  pid_t q_pid[128]; int q_tipo[128]; int qh = 0, qt = 0;
+  bool io_ativo = false;
+  unsigned long prazo_irq1 = 0;
+  pid_t cur_pid = 0; int cur_tipo = 0;
+  char buffer[256];
 
-    // Tick de 1s
-    kill(kpid, SIGUSR1);
-    printf("[IC %ldms] TICK (IRQ0)\n", rel_ms()); fflush(stdout);
+  while(true){
+    if (shm->done){
+      break;
+    }
 
-    // Ler FIFO
-    char buf[128];
-    ssize_t r = read(fd, buf, sizeof(buf)-1);
-    if (r > 0) {
-      buf[r] = 0;
-      char *p = buf;
-      while (*p) {
-        int pidv=0, tp=0, n=0;
-        if (sscanf(p, "%d %d%n", &pidv, &tp, &n) == 2) {
-          q_pid[qt] = (pid_t)pidv; q_type[qt] = tp; qt = (qt + 1) % 64;
-          printf("[IC %ldms] FILA <- pid=%d I/O=%s\n",
-                 rel_ms(), pidv, tp==0?"READ":"WRITE");
-          fflush(stdout);
-          p += n;
-        } else { break; }
+    usleep(100000); // 100ms
+    unsigned long t = tempo_ms();
+
+    /* IRQ0 periódico */
+    if (t >= prox_irq0){
+      kill(kpid, IRQ0_SIG);
+      printf("[IC %ldms] TICK (IRQ0)\n", rel_ms(t0));
+      fflush(stdout);
+      while (t >= prox_irq0){
+        prox_irq0 += MS_TIMESLICE;
       }
     }
 
-    // Inicia próximo atendimento se não ocupado
-    if (!busy && qh != qt) {
-      cur_pid = q_pid[qh];
-      cur_type = q_type[qh];
-      busy = 1;
-      end_time = time(NULL) + 3;
+    /* Leitura do FIFO: cada linha "PID TIPO\n" -> 1 pedido */
+    if (file_fifo >= 0) {
+      while(true){
+        int n = read(file_fifo, buffer, sizeof(buffer) - 1);
+        if (n > 0){
+          buffer[n] = '\0';
+          char *p = buffer;
+          while (*p){
+            int pidv=0, tp=0, consumido=0;
+            if (sscanf(p, "%d %d%n", &pidv, &tp, &consumido) == 2){
+              q_pid[qt] = (pid_t)pidv;
+              q_tipo[qt] = tp;
+              qt = (qt + 1) % 128;
+              printf("[IC %ldms] FILA <- pid=%d I/O=%s\n",
+                     rel_ms(t0), pidv, tp==0?"READ":"WRITE");
+              fflush(stdout);
+              p += consumido;
+            } else {
+              break;
+            }
+          }
+          continue;
+        }
+        break;
+      }
+    }
 
-      // marca "em serviço"
+    /* Inicia atendimento de I/O se livre e fila não vazia */
+    if (!io_ativo && qh !=qt){
+      cur_pid  = q_pid[qh];
+      cur_tipo = q_tipo[qh];
+      io_ativo = true;
+      prazo_irq1 = t + MS_IO;
+
       shm->d1_busy = 1;
       shm->io_inflight_pid = cur_pid;
 
-      printf("[IC %ldms] ATENDIMENTO INICIADO (pid=%d I/O=%s) | t_serviço=3s\n",
-             rel_ms(), (int)cur_pid, cur_type==0?"READ":"WRITE");
+      printf("[IC %ldms] ATENDIMENTO INICIADO (pid=%d I/O=%s) | t_serviço=3s\n", rel_ms(t0), (int)cur_pid, cur_tipo==0?"READ":"WRITE");
       fflush(stdout);
     }
 
-    // Se terminou o atendimento atual
-    if (busy && time(NULL) >= end_time) {
-      busy = 0;
-      // consome da fila
-      (void)q_pid[qh]; (void)q_type[qh];
-      qh = (qh + 1) % 64;
-
-      // marca "concluído"
+    /* Conclusão do atendimento e IRQ1 */
+    if (io_ativo && t >= prazo_irq1){
       shm->d1_busy = 0;
       shm->io_inflight_pid = 0;
       shm->io_done_pid = cur_pid;
-      shm->io_done_type = cur_type;
+      shm->io_done_type = cur_tipo;
 
-      printf("[IC %ldms] ATENDIMENTO CONCLUÍDO (pid=%d I/O=%s) -> IRQ1\n",
-             rel_ms(), (int)cur_pid, cur_type==0?"READ":"WRITE");
+      printf("[IC %ldms] ATENDIMENTO CONCLUÍDO (pid=%d I/O=%s) -> IRQ1\n", rel_ms(t0), (int)cur_pid, cur_tipo==0?"READ":"WRITE");
       fflush(stdout);
-      kill(kpid, SIGUSR2);
-    }
+      kill(kpid, IRQ1_SIG);
 
-    if (shm->done) break;
-    sleep(1);
+      /* Avança fila (Inicia próximo atendimento se houver mais pedidos) */
+      qh = (qh + 1) % 128;
+      if (qh!= qt){
+        cur_pid = q_pid[qh];
+        cur_tipo =q_tipo[qh];
+        io_ativo = true;
+        prazo_irq1 = t + MS_IO;
+
+        shm->d1_busy = 1;
+        shm->io_inflight_pid = cur_pid;
+
+        printf("[IC %ldms] ATENDIMENTO INICIADO (pid=%d I/O=%s) | t_serviço=3s\n", rel_ms(t0), (int)cur_pid, cur_tipo==0?"READ":"WRITE");
+        fflush(stdout);
+      } else {
+        io_ativo = false;
+      }
+    }
   }
 
-  close(fd);
+  if (file_fifo >= 0){
+    close(file_fifo);
+  }
+
   shmdt((void*)shm);
-  printf("[IC %ldms] FIM\n", rel_ms());
+  printf("[IC %ldms] FIM\n", rel_ms(t0));
+  fflush(stdout);
+
   return 0;
 }
