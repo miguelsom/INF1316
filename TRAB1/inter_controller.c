@@ -1,11 +1,22 @@
-// Integrantes do Grupo: Miguel Mendes (2111705) e Igor Lemos (2011287)
-/* inter_controller.c - Simula controlador de interrupções
-    - Envia SIGUSR1 (IRQ0) ao kernel a cada 1s (time-slice).
-    - Envia SIGUSR2 (IRQ1) ao kernel 3s após cada pedido de I/O no FIFO.
-
-  Uso:
-    ./inter_controller <shm_id> <kernel_pid>
-*/
+/**
+ * @file    inter_controller.c
+ * @brief   Simula o controlador de interrupções do sistema.
+ * @details Este processo envia sinais de interrupção (IRQ0 e IRQ1) ao kernel:
+ *          - IRQ0 (SIGUSR1) a cada 1s, simulando o clock (time-slice).
+ *          - IRQ1 (SIGUSR2) após 3s de um pedido de I/O recebido via FIFO.
+ * 
+ *          Ele lê pedidos de I/O do FIFO, atende um por vez (simulando 3s de serviço),
+ *          e sinaliza o kernel quando o I/O termina.
+ *
+ *          Uso:
+ *          ./inter_controller <shm_id> <kernel_pid>
+ *          
+ * 
+ * @note    Trabalho 1 - INF1316 (Sistemas Operacionais)
+ * @authors
+ *          Miguel Mendes (2111705)
+ *          Igor Lemos (2011287)
+ */
 
 #include <signal.h>
 #include <unistd.h>
@@ -18,32 +29,54 @@
 #include <sys/ipc.h>
 #include <sys/shm.h>
 
-/* Retorna o tempo em ms desde que o sistema foi iniciado */
+/**
+ * @brief  Retorna o tempo atual em milissegundos desde o boot do sistema.
+ * @return Tempo em milissegundos.
+ */
 static unsigned long tempo_ms(void){
-  struct timespec ts; // Struct do time.h, para guardar segundos e nanossegundos
-  clock_gettime(CLOCK_MONOTONIC, &ts); // Preenche a struct com o tempo "monotônico" (desde o boot)
-  return (ts.tv_sec * 1000) +(ts.tv_nsec / 1000000); // tv_sec é segundos, tv_nsec é nanossegundos
+  struct timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  return (ts.tv_sec * 1000) + (ts.tv_nsec / 1000000);
 }
 
-/* Retorna o tempo relativo em ms desde um t0 */
+/**
+ * @brief  Retorna o tempo relativo em milissegundos desde um tempo inicial t0.
+ * @param  t0 Tempo inicial em milissegundos.
+ * @return Diferença (tempo atual - t0) em milissegundos.
+ */
 static unsigned long rel_ms(unsigned long t0){
   return tempo_ms() - t0;
 }
 
-/* Estrutura deve ser compatível com a do kernel */
+/**
+ * @struct shm_data
+ * @brief  Estrutura compartilhada com o kernel e as aplicações.
+ * @details Reflete o estado global da simulação de I/O e processos.
+ */
 struct shm_data {
-  int  nprocs;
-  pid_t app_pid[6];
-  int  pc[6];
-  int  want_io[6];
-  int  io_type[6];
-  int  done;
-  int  d1_busy;
-  pid_t io_inflight_pid;
-  pid_t io_done_pid;
-  int   io_done_type;
+  int  nprocs;               /**< Número total de processos */
+  pid_t app_pid[6];          /**< PIDs das aplicações */
+  int  pc[6];                /**< Contadores de programa */
+  int  want_io[6];           /**< Flags de pedido de I/O */
+  int  io_type[6];           /**< Tipo de I/O (0=READ, 1=WRITE) */
+  int  done;                 /**< Flag de término global */
+  int  d1_busy;              /**< Indica se o dispositivo está ocupado */
+  pid_t io_inflight_pid;     /**< PID do processo em atendimento de I/O */
+  pid_t io_done_pid;         /**< PID do processo cujo I/O terminou */
+  int   io_done_type;        /**< Tipo do I/O concluído */
 };
 
+/**
+ * @brief  Processo principal do InterController.
+ * @param  argc Número de argumentos.
+ * @param  argv Argumentos passados pela linha de comando (<shm_id> <kernel_pid>).
+ * @return 0 em sucesso, >0 em falha.
+ * @details 
+ *  - Lê pedidos de I/O do FIFO ("/tmp/so_trab1_iofifo").
+ *  - Envia SIGUSR1 (IRQ0) ao kernel a cada 1s.
+ *  - Envia SIGUSR2 (IRQ1) ao kernel 3s após cada pedido de I/O.
+ *  - Controla fila de I/O e atualiza o estado na SHM.
+ */
 int main(int argc, char **argv){
   if (argc < 3){
     fprintf(stderr, "Uso: %s <shm_id> <kernel_pid>\n", argv[0]);
@@ -74,7 +107,7 @@ int main(int argc, char **argv){
   printf("[IC %ldms] INÍCIO (kpid=%d)\n", rel_ms(t0), (int)kpid);
   fflush(stdout);
 
-  /* Estado dos timers e fila */
+  // Estado interno do controlador
   unsigned long prox_irq0 = tempo_ms() + MS_TIMESLICE;
   pid_t q_pid[128]; int q_tipo[128]; int qh = 0, qt = 0;
   bool io_ativo = false;
@@ -90,7 +123,7 @@ int main(int argc, char **argv){
     sleep(1);
     unsigned long t = tempo_ms();
 
-    /* IRQ0 periódico */
+    // IRQ0 periódico (clock)
     if (t >= prox_irq0){
       kill(kpid, IRQ0_SIG);
       printf("[IC %ldms] TICK (IRQ0)\n", rel_ms(t0));
@@ -100,7 +133,7 @@ int main(int argc, char **argv){
       }
     }
 
-    /* Leitura do FIFO: cada linha "PID TIPO\n" -> 1 pedido */
+    // Leitura do FIFO: cada linha representa "PID TIPO\n"
     if (file_fifo >= 0) {
       while(true){
         int n = read(file_fifo, buffer, sizeof(buffer) - 1);
@@ -127,8 +160,8 @@ int main(int argc, char **argv){
       }
     }
 
-    /* Inicia atendimento de I/O se livre e fila não vazia */
-    if (!io_ativo && qh !=qt){
+    // Inicia atendimento de I/O se dispositivo livre e fila não vazia
+    if (!io_ativo && qh != qt){
       cur_pid  = q_pid[qh];
       cur_tipo = q_tipo[qh];
       io_ativo = true;
@@ -137,33 +170,36 @@ int main(int argc, char **argv){
       shm->d1_busy = 1;
       shm->io_inflight_pid = cur_pid;
 
-      printf("[IC %ldms] ATENDIMENTO INICIADO (pid=%d I/O=%s) | t_serviço=3s\n", rel_ms(t0), (int)cur_pid, cur_tipo==0?"READ":"WRITE");
+      printf("[IC %ldms] ATENDIMENTO INICIADO (pid=%d I/O=%s) | t_serviço=3s\n",
+             rel_ms(t0), (int)cur_pid, cur_tipo==0?"READ":"WRITE");
       fflush(stdout);
     }
 
-    /* Conclusão do atendimento e IRQ1 */
+    // Conclusão do atendimento e envio de IRQ1
     if (io_ativo && t >= prazo_irq1){
       shm->d1_busy = 0;
       shm->io_inflight_pid = 0;
       shm->io_done_pid = cur_pid;
       shm->io_done_type = cur_tipo;
 
-      printf("[IC %ldms] ATENDIMENTO CONCLUÍDO (pid=%d I/O=%s) -> IRQ1\n", rel_ms(t0), (int)cur_pid, cur_tipo==0?"READ":"WRITE");
+      printf("[IC %ldms] ATENDIMENTO CONCLUÍDO (pid=%d I/O=%s) -> IRQ1\n",
+             rel_ms(t0), (int)cur_pid, cur_tipo==0?"READ":"WRITE");
       fflush(stdout);
       kill(kpid, IRQ1_SIG);
 
-      /* Avança fila (Inicia próximo atendimento se houver mais pedidos) */
+      // Avança fila e inicia o próximo atendimento, se houver
       qh = (qh + 1) % 128;
-      if (qh!= qt){
+      if (qh != qt){
         cur_pid = q_pid[qh];
-        cur_tipo =q_tipo[qh];
+        cur_tipo = q_tipo[qh];
         io_ativo = true;
         prazo_irq1 = t + MS_IO;
 
         shm->d1_busy = 1;
         shm->io_inflight_pid = cur_pid;
 
-        printf("[IC %ldms] ATENDIMENTO INICIADO (pid=%d I/O=%s) | t_serviço=3s\n", rel_ms(t0), (int)cur_pid, cur_tipo==0?"READ":"WRITE");
+        printf("[IC %ldms] ATENDIMENTO INICIADO (pid=%d I/O=%s) | t_serviço=3s\n",
+               rel_ms(t0), (int)cur_pid, cur_tipo==0?"READ":"WRITE");
         fflush(stdout);
       } else {
         io_ativo = false;
