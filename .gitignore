@@ -53,5 +53,7 @@ dkms.conf
 
 # Ignore compiled binaries
 TRAB1/app
+TRAB1/app_cpu
+TRAB1/app_rw
 TRAB1/inter_controller
 TRAB1/kernel
