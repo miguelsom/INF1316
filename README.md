@@ -26,6 +26,20 @@ O objetivo é demonstrar, na prática, o funcionamento de um escalonador Round-R
   - **`app_rw`** — pede I/O em `pc=3` (**READ**) e `pc=8` (**WRITE**), alternando as operações.
 
 ```
+
+
++-----------------------------+
+|     inter_controller.c      |
+|-----------------------------|
+| - Envia IRQ0 (clock)        |
+| - Envia IRQ1 (I/O done)     |
+| - Lê pedidos do FIFO        |
+| - Escreve no SHM io_done    |
++--------------+--------------+
+               ^     |
+               |     IRQ0/IRQ1 + SHM
+               FIFO  |
+               |     v
 +-----------------------------+
 |          kernel.c           |
 |-----------------------------|
@@ -33,19 +47,10 @@ O objetivo é demonstrar, na prática, o funcionamento de um escalonador Round-R
 | - Controle de sinais        |
 | - Comunicação via SHM/FIFO  |
 +--------------+--------------+
-               ^
-               |  IRQ0 / IRQ1 (SIGUSR1 / SIGUSR2)
-               v
-+-----------------------------+
-|     inter_controller.c      |
-|-----------------------------|
-| - Envia IRQ0 (clock)        |
-| - Envia IRQ1 (I/O done)     |
-| - Lê pedidos do FIFO        |
-+--------------+--------------+
-               ^
-               |  SHM + FIFO
-               v
+               ^       |
+               |       SIGSTOP/SIGCONT
+               |  SHM  |
+               |       v
 +-----------------------------+
 |        Aplicações (APPs)    |
 |-----------------------------|
