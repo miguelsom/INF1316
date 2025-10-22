@@ -96,6 +96,13 @@ static volatile sig_atomic_t got_irq0 = 0;
 static volatile sig_atomic_t got_irq1 = 0;
 static volatile sig_atomic_t stop_flag = 0;
 
+/**
+ * @brief  Caminho do executável de cada tarefa (A1..A6).
+ * @details Preenchido a partir dos blocos "-- <app>" passados na linha de comando.
+ *          Se algum índice não for preenchido, usa-se "./app" como compatibilidade.
+ */
+static char *app_path[MAXN] = {0};
+
 // ============================================================================
 // Funções auxiliares de estado e escalonamento
 // ============================================================================
@@ -252,16 +259,21 @@ static void spawn_inter_controller(void) {
 }
 
 /**
- * @brief Cria os processos de aplicação (APPs).
+ * @brief Cria os processos de aplicação (APPs) com executável específico por tarefa.
+ * @details Para cada tarefa i, se app_path[i] for não nulo, usa esse caminho;
+ *          caso contrário, usa "./app" para manter compatibilidade.
  */
 static void spawn_apps(void) {
   for (int i = 0; i < num_procs; i++) {
+    const char *path = app_path[i] ? app_path[i] : "./app";
     pid_t p = fork();
     if (p < 0) { perror("fork app"); exit(1); }
     if (p == 0) {
       char shmid_s[32];
       snprintf(shmid_s, sizeof(shmid_s), "%d", shm_id);
-      execlp("./app", "./app", shmid_s, (char*)NULL);
+      // Log opcional para auditoria: qual executável será rodado
+      // fprintf(stderr, "[KRL] spawn #%d -> %s\n", i, path);
+      execlp(path, path, shmid_s, (char*)NULL);
       _exit(127);
     }
     proc_pids[i] = p;
@@ -273,6 +285,8 @@ static void spawn_apps(void) {
 
 /**
  * @brief Retorna o índice de um processo pelo PID.
+ * @param p PID do processo.
+ * @return Índice em [0..num_procs-1] ou -1 se não encontrado.
  */
 static int idx_of_pid(pid_t p) {
   for (int i = 0; i < num_procs; i++) if (proc_pids[i] == p) return i;
@@ -280,13 +294,22 @@ static int idx_of_pid(pid_t p) {
 }
 
 /**
- * @brief Conta quantos blocos "-- ./app" existem na linha de comando.
+ * @brief  Lê blocos "-- <app>" da linha de comando e preenche app_path[].
+ * @param  argc Número de argumentos.
+ * @param  argv Argumentos.
+ * @return Quantidade de tarefas (blocos) encontrados.
+ * @details Cada ocorrência de "--" seguida de um caminho conta como uma tarefa.
+ *          Ex.: ./kernel 1 20 -- ./app_cpu -- ./app_rw
  */
-static int count_app_blocks(int argc, char **argv) {
+static int parse_app_blocks_and_paths(int argc, char **argv) {
   int count = 0;
   for (int i = 3; i < argc; i++) {
-    if (strcmp(argv[i], "--") == 0) {
-      if (i + 1 < argc) { count++; i++; }
+    if (strcmp(argv[i], "--") == 0 && (i + 1) < argc) {
+      if (count < MAXN) {
+        app_path[count] = argv[i + 1];
+        count++;
+      }
+      i++; // pula o caminho após "--"
     }
   }
   return count;
@@ -311,9 +334,11 @@ int main(int argc, char **argv) {
   time_slice_seconds   = (argc > 1) ? atoi(argv[1]) : 1;
   run_duration_seconds = (argc > 2) ? atoi(argv[2]) : 15;
 
-  int blocks = count_app_blocks(argc, argv);
+  // Lê os executáveis por tarefa (se fornecidos)
+  int blocks = parse_app_blocks_and_paths(argc, argv);
   if (blocks <= 0) {
-    fprintf(stderr, "[KRL] ERRO: uso: ./kernel <q> <dur> -- ./app [-- ./app]...\n");
+    fprintf(stderr, "[KRL] ERRO: uso: ./kernel <q> <dur> -- <app1> [-- <app2>] ...\n");
+    fprintf(stderr, "Ex.: ./kernel 1 20 -- ./app_cpu -- ./app_rw -- ./app_cpu\n");
     return 2;
   }
   if (blocks < MINN || blocks > MAXN) {
